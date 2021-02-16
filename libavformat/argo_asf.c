@@ -75,17 +75,17 @@ void ff_argo_asf_parse_chunk_header(ArgoASFChunkHeader *hdr, const uint8_t *buf)
     hdr->flags          = AV_RL32(buf + 16);
 }
 
-int ff_argo_asf_fill_stream(AVStream *st, const ArgoASFFileHeader *fhdr,
+int ff_argo_asf_fill_stream(AVFormatContext *s, AVStream *st, const ArgoASFFileHeader *fhdr,
                             const ArgoASFChunkHeader *ckhdr)
 {
     if (ckhdr->num_samples != ASF_SAMPLE_COUNT) {
-        av_log(st, AV_LOG_ERROR, "Invalid sample count. Got %u, expected %d\n",
+        av_log(s, AV_LOG_ERROR, "Invalid sample count. Got %u, expected %d\n",
                ckhdr->num_samples, ASF_SAMPLE_COUNT);
         return AVERROR_INVALIDDATA;
     }
 
     if ((ckhdr->flags & ASF_CF_ALWAYS1) != ASF_CF_ALWAYS1 || (ckhdr->flags & ASF_CF_ALWAYS0) != 0) {
-        avpriv_request_sample(st, "Nonstandard flags (0x%08X)", ckhdr->flags);
+        avpriv_request_sample(s, "Nonstandard flags (0x%08X)", ckhdr->flags);
         return AVERROR_PATCHWELCOME;
     }
 
@@ -116,7 +116,7 @@ int ff_argo_asf_fill_stream(AVStream *st, const ArgoASFFileHeader *fhdr,
 
     if (st->codecpar->bits_per_raw_sample != 16) {
         /* The header allows for these, but I've never seen any files with them. */
-        avpriv_request_sample(st, "Non 16-bit samples");
+        avpriv_request_sample(s, "Non 16-bit samples");
         return AVERROR_PATCHWELCOME;
     }
 
@@ -212,7 +212,7 @@ static int argo_asf_read_header(AVFormatContext *s)
 
     ff_argo_asf_parse_chunk_header(&asf->ckhdr, buf);
 
-    return ff_argo_asf_fill_stream(st, &asf->fhdr, &asf->ckhdr);
+    return ff_argo_asf_fill_stream(s, st, &asf->fhdr, &asf->ckhdr);
 }
 
 static int argo_asf_read_packet(AVFormatContext *s, AVPacket *pkt)
@@ -238,9 +238,31 @@ static int argo_asf_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     pkt->stream_index   = st->index;
     pkt->duration       = asf->ckhdr.num_samples * (ret / st->codecpar->block_align);
+    pkt->pts            = asf->blocks_read * asf->ckhdr.num_samples;
     asf->blocks_read   += (ret / st->codecpar->block_align);
 
     pkt->flags &= ~AV_PKT_FLAG_CORRUPT;
+    return 0;
+}
+
+static int argo_asf_seek(AVFormatContext *s, int stream_index,
+                         int64_t pts, int flags)
+{
+    ArgoASFDemuxContext *asf = s->priv_data;
+    AVStream *st             = s->streams[stream_index];
+    int64_t offset;
+    uint32_t block = pts / asf->ckhdr.num_samples;
+
+    if (block >= asf->ckhdr.num_blocks)
+        return -1;
+
+    offset = asf->fhdr.chunk_offset + ASF_CHUNK_HEADER_SIZE +
+             (block * st->codecpar->block_align);
+
+    if ((offset = avio_seek(s->pb, offset, SEEK_SET)) < 0)
+        return offset;
+
+    asf->blocks_read = block;
     return 0;
 }
 
@@ -255,7 +277,8 @@ AVInputFormat ff_argo_asf_demuxer = {
     .priv_data_size = sizeof(ArgoASFDemuxContext),
     .read_probe     = argo_asf_probe,
     .read_header    = argo_asf_read_header,
-    .read_packet    = argo_asf_read_packet
+    .read_packet    = argo_asf_read_packet,
+    .read_seek      = argo_asf_seek,
 };
 #endif
 

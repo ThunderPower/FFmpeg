@@ -51,7 +51,7 @@ typedef struct AAXContext {
     int64_t strings_size;
     char *string_table;
 
-    int current_segment;
+    uint32_t current_segment;
 
     AAXColumn *xcolumns;
     AAXSegment *segments;
@@ -232,14 +232,14 @@ static int aax_read_header(AVFormatContext *s)
         int64_t col_offset;
         int flag, type;
 
-        if (strcmp(a->xcolumns[c].name, "data"))
+        if (!a->xcolumns[c].name || strcmp(a->xcolumns[c].name, "data"))
             continue;
 
         type = a->xcolumns[c].type;
         flag = a->xcolumns[c].flag;
         col_offset = a->xcolumns[c].offset;
 
-        for (int r = 0; r < a->nb_segments; r++) {
+        for (uint64_t r = 0; r < a->nb_segments; r++) {
             if (flag & COLUMN_FLAG_DEFAULT) {
                 data_offset = a->schema_offset + col_offset;
             } else if (flag & COLUMN_FLAG_ROW) {
@@ -330,7 +330,7 @@ static int aax_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     pkt->pos = avio_tell(pb);
 
-    for (int seg = 0; seg < a->nb_segments; seg++) {
+    for (uint32_t seg = 0; seg < a->nb_segments; seg++) {
         int64_t start = a->segments[seg].start;
         int64_t end   = a->segments[seg].end;
 

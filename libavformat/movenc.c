@@ -633,12 +633,59 @@ static unsigned compute_avg_bitrate(MOVTrack *track)
     return size * 8 * track->timescale / track->track_duration;
 }
 
+struct mpeg4_bit_rate_values {
+    uint32_t buffer_size;  ///< Size of the decoding buffer for the elementary stream in bytes.
+    uint32_t max_bit_rate; ///< Maximum rate in bits/second over any window of one second.
+    uint32_t avg_bit_rate; ///< Average rate in bits/second over the entire presentation.
+};
+
+static struct mpeg4_bit_rate_values calculate_mpeg4_bit_rates(MOVTrack *track)
+{
+    AVCPBProperties *props = track->st ?
+        (AVCPBProperties*)av_stream_get_side_data(track->st,
+                                                  AV_PKT_DATA_CPB_PROPERTIES,
+                                                  NULL) :
+        NULL;
+    struct mpeg4_bit_rate_values bit_rates = { 0 };
+
+    bit_rates.avg_bit_rate = compute_avg_bitrate(track);
+    if (!bit_rates.avg_bit_rate) {
+        // if the average bit rate cannot be calculated at this point, such as
+        // in the case of fragmented MP4, utilize the following values as
+        // fall-back in priority order:
+        //
+        // 1. average bit rate property
+        // 2. bit rate (usually average over the whole clip)
+        // 3. maximum bit rate property
+
+        if (props && props->avg_bitrate) {
+            bit_rates.avg_bit_rate = props->avg_bitrate;
+        } else if (track->par->bit_rate) {
+            bit_rates.avg_bit_rate = track->par->bit_rate;
+        } else if (props && props->max_bitrate) {
+            bit_rates.avg_bit_rate = props->max_bitrate;
+        }
+    }
+
+    // (FIXME should be max rate in any 1 sec window)
+    bit_rates.max_bit_rate = FFMAX(track->par->bit_rate,
+                                   bit_rates.avg_bit_rate);
+
+    // utilize values from properties if we have them available
+    if (props) {
+        bit_rates.max_bit_rate = FFMAX(bit_rates.max_bit_rate,
+                                       props->max_bitrate);
+        bit_rates.buffer_size = props->buffer_size / 8;
+    }
+
+    return bit_rates;
+}
+
 static int mov_write_esds_tag(AVIOContext *pb, MOVTrack *track) // Basic
 {
-    AVCPBProperties *props;
+    struct mpeg4_bit_rate_values bit_rates = calculate_mpeg4_bit_rates(track);
     int64_t pos = avio_tell(pb);
     int decoder_specific_info_len = track->vos_len ? 5 + track->vos_len : 0;
-    unsigned avg_bitrate;
 
     avio_wb32(pb, 0); // size
     ffio_wfourcc(pb, "esds");
@@ -669,14 +716,9 @@ static int mov_write_esds_tag(AVIOContext *pb, MOVTrack *track) // Basic
     else
         avio_w8(pb, 0x11); // flags (= Visualstream)
 
-    props = (AVCPBProperties*)av_stream_get_side_data(track->st, AV_PKT_DATA_CPB_PROPERTIES,
-                                                      NULL);
-
-    avio_wb24(pb, props ? props->buffer_size / 8 : 0); // Buffersize DB
-
-    avg_bitrate = compute_avg_bitrate(track);
-    avio_wb32(pb, props ? FFMAX3(props->max_bitrate, props->avg_bitrate, avg_bitrate) : FFMAX(track->par->bit_rate, avg_bitrate)); // maxbitrate (FIXME should be max rate in any 1 sec window)
-    avio_wb32(pb, avg_bitrate);
+    avio_wb24(pb, bit_rates.buffer_size); // Buffersize DB
+    avio_wb32(pb, bit_rates.max_bit_rate); // maxbitrate
+    avio_wb32(pb, bit_rates.avg_bit_rate);
 
     if (track->vos_len) {
         // DecoderSpecific info descriptor
@@ -1049,6 +1091,25 @@ static int get_samples_per_packet(MOVTrack *track)
     return first_duration;
 }
 
+static int mov_write_btrt_tag(AVIOContext *pb, MOVTrack *track)
+{
+    int64_t pos = avio_tell(pb);
+    struct mpeg4_bit_rate_values bit_rates = calculate_mpeg4_bit_rates(track);
+    if (!bit_rates.max_bit_rate && !bit_rates.avg_bit_rate &&
+        !bit_rates.buffer_size)
+        // no useful data to be written, skip
+        return 0;
+
+    avio_wb32(pb, 0); /* size */
+    ffio_wfourcc(pb, "btrt");
+
+    avio_wb32(pb, bit_rates.buffer_size);
+    avio_wb32(pb, bit_rates.max_bit_rate);
+    avio_wb32(pb, bit_rates.avg_bit_rate);
+
+    return update_size(pb, pos);
+}
+
 static int mov_write_audio_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContext *mov, MOVTrack *track)
 {
     int64_t pos = avio_tell(pb);
@@ -1196,6 +1257,10 @@ static int mov_write_audio_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContex
             && ((ret = ff_mov_cenc_write_sinf_tag(track, pb, mov->encryption_kid)) < 0)) {
         return ret;
     }
+
+    if (track->mode == MODE_MP4 &&
+            ((ret = mov_write_btrt_tag(pb, track)) < 0))
+        return ret;
 
     ret = update_size(pb, pos);
     return ret;
@@ -1588,6 +1653,10 @@ static unsigned int mov_get_codec_tag(AVFormatContext *s, MOVTrack *track)
 {
     unsigned int tag = track->par->codec_tag;
 
+    // "rtp " is used to distinguish internally created RTP-hint tracks
+    // (with rtp_ctx) from other tracks.
+    if (tag == MKTAG('r','t','p',' '))
+        tag = 0;
     if (!tag || (s->strict_std_compliance >= FF_COMPLIANCE_NORMAL &&
                  (track->par->codec_id == AV_CODEC_ID_DVVIDEO ||
                   track->par->codec_id == AV_CODEC_ID_RAWVIDEO ||
@@ -1712,6 +1781,7 @@ static int mov_write_fiel_tag(AVIOContext *pb, MOVTrack *track, int field_order)
 
 static int mov_write_subtitle_tag(AVIOContext *pb, MOVTrack *track)
 {
+    int ret = AVERROR_BUG;
     int64_t pos = avio_tell(pb);
     avio_wb32(pb, 0);    /* size */
     avio_wl32(pb, track->tag); // store it byteswapped
@@ -1723,6 +1793,10 @@ static int mov_write_subtitle_tag(AVIOContext *pb, MOVTrack *track)
         mov_write_esds_tag(pb, track);
     else if (track->par->extradata_size)
         avio_write(pb, track->par->extradata, track->par->extradata_size);
+
+    if (track->mode == MODE_MP4 &&
+            ((ret = mov_write_btrt_tag(pb, track)) < 0))
+        return ret;
 
     return update_size(pb, pos);
 }
@@ -1951,7 +2025,6 @@ static int mov_write_clli_tag(AVIOContext *pb, MOVTrack *track)
 
     side_data = av_stream_get_side_data(track->st, AV_PKT_DATA_CONTENT_LIGHT_LEVEL, NULL);
     if (!side_data) {
-        av_log(NULL, AV_LOG_VERBOSE, "Not writing 'clli' atom. No content light level info.\n");
         return 0;
     }
     content_light_metadata = (const AVContentLightMetadata*)side_data;
@@ -1978,7 +2051,6 @@ static int mov_write_mdcv_tag(AVIOContext *pb, MOVTrack *track)
     side_data = av_stream_get_side_data(track->st, AV_PKT_DATA_MASTERING_DISPLAY_METADATA, NULL);
     metadata = (const AVMasteringDisplayMetadata*)side_data;
     if (!metadata || !metadata->has_primaries || !metadata->has_luminance) {
-        av_log(NULL, AV_LOG_VERBOSE, "Not writing 'mdcv' atom. Missing mastering metadata.\n");
         return 0;
     }
 
@@ -2027,6 +2099,7 @@ static void find_compressor(char * compressor_name, int len, MOVTrack *track)
 
 static int mov_write_video_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContext *mov, MOVTrack *track)
 {
+    int ret = AVERROR_BUG;
     int64_t pos = avio_tell(pb);
     char compressor_name[32] = { 0 };
     int avid = 0;
@@ -2206,6 +2279,10 @@ static int mov_write_video_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContex
     if (mov->encryption_scheme != MOV_ENC_NONE) {
         ff_mov_cenc_write_sinf_tag(track, pb, mov->encryption_kid);
     }
+
+    if (track->mode == MODE_MP4 &&
+            ((ret = mov_write_btrt_tag(pb, track)) < 0))
+        return ret;
 
     /* extra padding for avid stsd */
     /* https://developer.apple.com/library/mac/documentation/QuickTime/QTFF/QTFFChap2/qtff2.html#//apple_ref/doc/uid/TP40000939-CH204-61112 */
@@ -2825,21 +2902,50 @@ static int mov_write_minf_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContext
     return update_size(pb, pos);
 }
 
-static int64_t calc_pts_duration(MOVMuxContext *mov, MOVTrack *track)
+static void get_pts_range(MOVMuxContext *mov, MOVTrack *track,
+                          int64_t *start, int64_t *end)
 {
-    if (track->tag == MKTAG('t','m','c','d')) {
+    if (track->tag == MKTAG('t','m','c','d') && mov->nb_meta_tmcd) {
         // tmcd tracks gets track_duration set in mov_write_moov_tag from
         // another track's duration, while the end_pts may be left at zero.
         // Calculate the pts duration for that track instead.
-        return av_rescale(calc_pts_duration(mov, &mov->tracks[track->src_track]),
-                          track->timescale, mov->tracks[track->src_track].timescale);
+        get_pts_range(mov, &mov->tracks[track->src_track], start, end);
+        *start = av_rescale(*start, track->timescale,
+                            mov->tracks[track->src_track].timescale);
+        *end   = av_rescale(*end, track->timescale,
+                            mov->tracks[track->src_track].timescale);
+        return;
     }
     if (track->end_pts != AV_NOPTS_VALUE &&
         track->start_dts != AV_NOPTS_VALUE &&
         track->start_cts != AV_NOPTS_VALUE) {
-        return track->end_pts - (track->start_dts + track->start_cts);
+        *start = track->start_dts + track->start_cts;
+        *end   = track->end_pts;
+        return;
     }
-    return track->track_duration;
+    *start = 0;
+    *end   = track->track_duration;
+}
+
+static int64_t calc_samples_pts_duration(MOVMuxContext *mov, MOVTrack *track)
+{
+    int64_t start, end;
+    get_pts_range(mov, track, &start, &end);
+    return end - start;
+}
+
+// Calculate the actual duration of the track, after edits.
+// If it starts with a pts < 0, that is removed by the edit list.
+// If it starts with a pts > 0, the edit list adds a delay before that.
+// Thus, with edit lists enabled, the post-edit output of the file is
+// starting with pts=0.
+static int64_t calc_pts_duration(MOVMuxContext *mov, MOVTrack *track)
+{
+    int64_t start, end;
+    get_pts_range(mov, track, &start, &end);
+    if (mov->use_editlist != 0)
+        start = 0;
+    return end - start;
 }
 
 static int mov_write_mdhd_tag(AVIOContext *pb, MOVMuxContext *mov,
@@ -3066,7 +3172,7 @@ static int mov_write_tapt_tag(AVIOContext *pb, MOVTrack *track)
 static int mov_write_edts_tag(AVIOContext *pb, MOVMuxContext *mov,
                               MOVTrack *track)
 {
-    int64_t duration = av_rescale_rnd(calc_pts_duration(mov, track),
+    int64_t duration = av_rescale_rnd(calc_samples_pts_duration(mov, track),
                                       MOV_TIMESCALE, track->timescale,
                                       AV_ROUND_UP);
     int version = duration < INT32_MAX ? 0 : 1;
@@ -4135,8 +4241,6 @@ static int mov_write_isml_manifest(AVIOContext *pb, MOVMuxContext *mov, AVFormat
 {
     int64_t pos = avio_tell(pb);
     int i;
-    int64_t manifest_bit_rate = 0;
-    AVCPBProperties *props = NULL;
 
     static const uint8_t uuid[] = {
         0xa5, 0xd4, 0x0b, 0x30, 0xe8, 0x14, 0x11, 0xdd,
@@ -4162,6 +4266,8 @@ static int mov_write_isml_manifest(AVIOContext *pb, MOVMuxContext *mov, AVFormat
 
     for (i = 0; i < mov->nb_streams; i++) {
         MOVTrack *track = &mov->tracks[i];
+        struct mpeg4_bit_rate_values bit_rates =
+            calculate_mpeg4_bit_rates(track);
         const char *type;
         int track_id = track->track_id;
         char track_name_buf[32] = { 0 };
@@ -4177,17 +4283,9 @@ static int mov_write_isml_manifest(AVIOContext *pb, MOVMuxContext *mov, AVFormat
             continue;
         }
 
-        props = (AVCPBProperties*)av_stream_get_side_data(track->st, AV_PKT_DATA_CPB_PROPERTIES, NULL);
-
-        if (track->par->bit_rate) {
-            manifest_bit_rate = track->par->bit_rate;
-        } else if (props) {
-            manifest_bit_rate = props->max_bitrate;
-        }
-
-        avio_printf(pb, "<%s systemBitrate=\"%"PRId64"\">\n", type,
-                    manifest_bit_rate);
-        param_write_int(pb, "systemBitrate", manifest_bit_rate);
+        avio_printf(pb, "<%s systemBitrate=\"%"PRIu32"\">\n", type,
+                    bit_rates.avg_bit_rate);
+        param_write_int(pb, "systemBitrate", bit_rates.avg_bit_rate);
         param_write_int(pb, "trackID", track_id);
         param_write_string(pb, "systemLanguage", lang ? lang->value : "und");
 
@@ -5203,15 +5301,19 @@ static int mov_flush_fragment(AVFormatContext *s, int force)
     for (i = 0; i < s->nb_streams; i++) {
         MOVTrack *track = &mov->tracks[i];
         if (!track->end_reliable) {
-            AVPacket pkt;
-            if (!ff_interleaved_peek(s, i, &pkt, 1)) {
+            const AVPacket *pkt = ff_interleaved_peek(s, i);
+            if (pkt) {
+                int64_t offset, dts, pts;
+                ff_get_muxer_ts_offset(s, i, &offset);
+                pts = pkt->pts + offset;
+                dts = pkt->dts + offset;
                 if (track->dts_shift != AV_NOPTS_VALUE)
-                    pkt.dts += track->dts_shift;
-                track->track_duration = pkt.dts - track->start_dts;
-                if (pkt.pts != AV_NOPTS_VALUE)
-                    track->end_pts = pkt.pts;
+                    dts += track->dts_shift;
+                track->track_duration = dts - track->start_dts;
+                if (pts != AV_NOPTS_VALUE)
+                    track->end_pts = pts;
                 else
-                    track->end_pts = pkt.dts;
+                    track->end_pts = dts;
             }
         }
     }
@@ -6094,11 +6196,12 @@ static int mov_check_timecode_track(AVFormatContext *s, AVTimecode *tc, int src_
 
 static int mov_create_timecode_track(AVFormatContext *s, int index, int src_index, AVTimecode tc)
 {
-    int ret;
     MOVMuxContext *mov  = s->priv_data;
     MOVTrack *track     = &mov->tracks[index];
     AVStream *src_st    = s->streams[src_index];
-    AVPacket pkt    = {.stream_index = index, .flags = AV_PKT_FLAG_KEY, .size = 4};
+    uint8_t data[4];
+    AVPacket pkt    = { .data = data, .stream_index = index,
+                        .flags = AV_PKT_FLAG_KEY, .size = 4 };
     AVRational rate = find_fps(s, src_st);
 
     /* tmcd track based on video stream */
@@ -6121,13 +6224,8 @@ static int mov_create_timecode_track(AVFormatContext *s, int index, int src_inde
     track->st->avg_frame_rate = av_inv_q(rate);
 
     /* the tmcd track just contains one packet with the frame number */
-    pkt.data = av_malloc(pkt.size);
-    if (!pkt.data)
-        return AVERROR(ENOMEM);
     AV_WB32(pkt.data, tc.start);
-    ret = ff_mov_write_packet(s, &pkt);
-    av_free(pkt.data);
-    return ret;
+    return ff_mov_write_packet(s, &pkt);
 }
 
 /*
@@ -6188,10 +6286,11 @@ static void mov_free(AVFormatContext *s)
     MOVMuxContext *mov = s->priv_data;
     int i;
 
+    if (!mov->tracks)
+        return;
+
     if (mov->chapter_track) {
-        if (mov->tracks[mov->chapter_track].par)
-            av_freep(&mov->tracks[mov->chapter_track].par->extradata);
-        av_freep(&mov->tracks[mov->chapter_track].par);
+        avcodec_parameters_free(&mov->tracks[mov->chapter_track].par);
     }
 
     for (i = 0; i < mov->nb_streams; i++) {
@@ -6212,9 +6311,11 @@ static void mov_free(AVFormatContext *s)
             av_freep(&mov->tracks[i].vos_data);
 
         ff_mov_cenc_free(&mov->tracks[i].cenc);
+        ffio_free_dyn_buf(&mov->tracks[i].mdat_buf);
     }
 
     av_freep(&mov->tracks);
+    ffio_free_dyn_buf(&mov->mdat_buf);
 }
 
 static uint32_t rgb_to_yuv(uint32_t rgb)
@@ -6911,6 +7012,7 @@ static int mov_write_trailer(AVFormatContext *s)
             AVCodecParameters *par = track->par;
 
             track->vos_len  = par->extradata_size;
+            av_freep(&track->vos_data);
             track->vos_data = av_malloc(track->vos_len + AV_INPUT_BUFFER_PADDING_SIZE);
             if (!track->vos_data)
                 return AVERROR(ENOMEM);
@@ -7040,7 +7142,7 @@ static const AVCodecTag codec_3gp_tags[] = {
     { AV_CODEC_ID_NONE, 0 },
 };
 
-const AVCodecTag codec_mp4_tags[] = {
+static const AVCodecTag codec_mp4_tags[] = {
     { AV_CODEC_ID_MPEG4,           MKTAG('m', 'p', '4', 'v') },
     { AV_CODEC_ID_H264,            MKTAG('a', 'v', 'c', '1') },
     { AV_CODEC_ID_H264,            MKTAG('a', 'v', 'c', '3') },
@@ -7057,6 +7159,7 @@ const AVCodecTag codec_mp4_tags[] = {
     { AV_CODEC_ID_VP9,             MKTAG('v', 'p', '0', '9') },
     { AV_CODEC_ID_AV1,             MKTAG('a', 'v', '0', '1') },
     { AV_CODEC_ID_AAC,             MKTAG('m', 'p', '4', 'a') },
+    { AV_CODEC_ID_ALAC,            MKTAG('a', 'l', 'a', 'c') },
     { AV_CODEC_ID_MP4ALS,          MKTAG('m', 'p', '4', 'a') },
     { AV_CODEC_ID_MP3,             MKTAG('m', 'p', '4', 'a') },
     { AV_CODEC_ID_MP2,             MKTAG('m', 'p', '4', 'a') },
@@ -7076,7 +7179,7 @@ const AVCodecTag codec_mp4_tags[] = {
     { AV_CODEC_ID_NONE,               0 },
 };
 
-const AVCodecTag codec_ism_tags[] = {
+static const AVCodecTag codec_ism_tags[] = {
     { AV_CODEC_ID_WMAPRO      , MKTAG('w', 'm', 'a', ' ') },
     { AV_CODEC_ID_NONE        ,    0 },
 };

@@ -34,6 +34,7 @@ extern AVInputFormat  ff_aac_demuxer;
 extern AVInputFormat  ff_aax_demuxer;
 extern AVInputFormat  ff_ac3_demuxer;
 extern AVOutputFormat ff_ac3_muxer;
+extern AVInputFormat  ff_ace_demuxer;
 extern AVInputFormat  ff_acm_demuxer;
 extern AVInputFormat  ff_act_demuxer;
 extern AVInputFormat  ff_adf_demuxer;
@@ -48,10 +49,12 @@ extern AVInputFormat  ff_aiff_demuxer;
 extern AVOutputFormat ff_aiff_muxer;
 extern AVInputFormat  ff_aix_demuxer;
 extern AVInputFormat  ff_alp_demuxer;
+extern AVOutputFormat ff_alp_muxer;
 extern AVInputFormat  ff_amr_demuxer;
 extern AVOutputFormat ff_amr_muxer;
 extern AVInputFormat  ff_amrnb_demuxer;
 extern AVInputFormat  ff_amrwb_demuxer;
+extern AVOutputFormat ff_amv_muxer;
 extern AVInputFormat  ff_anm_demuxer;
 extern AVInputFormat  ff_apc_demuxer;
 extern AVInputFormat  ff_ape_demuxer;
@@ -86,10 +89,12 @@ extern AVInputFormat  ff_avr_demuxer;
 extern AVInputFormat  ff_avs_demuxer;
 extern AVInputFormat  ff_avs2_demuxer;
 extern AVOutputFormat ff_avs2_muxer;
+extern AVInputFormat  ff_avs3_demuxer;
 extern AVInputFormat  ff_bethsoftvid_demuxer;
 extern AVInputFormat  ff_bfi_demuxer;
 extern AVInputFormat  ff_bintext_demuxer;
 extern AVInputFormat  ff_bink_demuxer;
+extern AVInputFormat  ff_binka_demuxer;
 extern AVInputFormat  ff_bit_demuxer;
 extern AVOutputFormat ff_bit_muxer;
 extern AVInputFormat  ff_bmv_demuxer;
@@ -211,6 +216,7 @@ extern AVInputFormat  ff_image2_brender_pix_demuxer;
 extern AVInputFormat  ff_ingenient_demuxer;
 extern AVInputFormat  ff_ipmovie_demuxer;
 extern AVOutputFormat ff_ipod_muxer;
+extern AVInputFormat  ff_ipu_demuxer;
 extern AVInputFormat  ff_ircam_demuxer;
 extern AVOutputFormat ff_ircam_muxer;
 extern AVOutputFormat ff_ismv_muxer;
@@ -281,6 +287,7 @@ extern AVInputFormat  ff_mpl2_demuxer;
 extern AVInputFormat  ff_mpsub_demuxer;
 extern AVInputFormat  ff_msf_demuxer;
 extern AVInputFormat  ff_msnwc_tcp_demuxer;
+extern AVInputFormat  ff_msp_demuxer;
 extern AVInputFormat  ff_mtaf_demuxer;
 extern AVInputFormat  ff_mtv_demuxer;
 extern AVInputFormat  ff_musx_demuxer;
@@ -486,6 +493,7 @@ extern AVInputFormat  ff_yuv4mpegpipe_demuxer;
 extern AVOutputFormat ff_yuv4mpegpipe_muxer;
 /* image demuxers */
 extern AVInputFormat  ff_image_bmp_pipe_demuxer;
+extern AVInputFormat  ff_image_cri_pipe_demuxer;
 extern AVInputFormat  ff_image_dds_pipe_demuxer;
 extern AVInputFormat  ff_image_dpx_pipe_demuxer;
 extern AVInputFormat  ff_image_exr_pipe_demuxer;
@@ -510,6 +518,7 @@ extern AVInputFormat  ff_image_svg_pipe_demuxer;
 extern AVInputFormat  ff_image_sunrast_pipe_demuxer;
 extern AVInputFormat  ff_image_tiff_pipe_demuxer;
 extern AVInputFormat  ff_image_webp_pipe_demuxer;
+extern AVInputFormat  ff_image_xbm_pipe_demuxer;
 extern AVInputFormat  ff_image_xpm_pipe_demuxer;
 extern AVInputFormat  ff_image_xwd_pipe_demuxer;
 
@@ -534,7 +543,7 @@ const AVOutputFormat *av_muxer_iterate(void **opaque)
 
     if (i < size) {
         f = muxer_list[i];
-    } else if (indev_list) {
+    } else if (outdev_list) {
         f = outdev_list[i - size];
     }
 
@@ -551,7 +560,7 @@ const AVInputFormat *av_demuxer_iterate(void **opaque)
 
     if (i < size) {
         f = demuxer_list[i];
-    } else if (outdev_list) {
+    } else if (indev_list) {
         f = indev_list[i - size];
     }
 

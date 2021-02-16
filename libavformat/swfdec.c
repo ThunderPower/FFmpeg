@@ -33,6 +33,7 @@
 #include "libavutil/intreadwrite.h"
 #include "libavcodec/get_bits.h"
 #include "swf.h"
+#include "flv.h"
 
 typedef struct SWFDecContext {
     int samples_per_frame;
@@ -140,6 +141,8 @@ retry:
 
     return buf_size - z->avail_out;
 }
+
+static av_cold int swf_read_close(AVFormatContext *avctx);
 #endif
 
 static int swf_read_header(AVFormatContext *s)
@@ -154,19 +157,18 @@ static int swf_read_header(AVFormatContext *s)
     if (tag == MKBETAG('C', 'W', 'S', 0)) {
         av_log(s, AV_LOG_INFO, "SWF compressed file detected\n");
 #if CONFIG_ZLIB
-        swf->zbuf_in  = av_malloc(ZBUF_SIZE);
-        swf->zbuf_out = av_malloc(ZBUF_SIZE);
-        swf->zpb = avio_alloc_context(swf->zbuf_out, ZBUF_SIZE, 0, s,
-                                      zlib_refill, NULL, NULL);
-        if (!swf->zbuf_in || !swf->zbuf_out || !swf->zpb)
-            return AVERROR(ENOMEM);
-        swf->zpb->seekable = 0;
         if (inflateInit(&swf->zstream) != Z_OK) {
             av_log(s, AV_LOG_ERROR, "Unable to init zlib context\n");
-            av_freep(&swf->zbuf_in);
-            av_freep(&swf->zbuf_out);
             return AVERROR(EINVAL);
         }
+        if (!(swf->zbuf_in  = av_malloc(ZBUF_SIZE)) ||
+            !(swf->zbuf_out = av_malloc(ZBUF_SIZE)) ||
+            !(swf->zpb = avio_alloc_context(swf->zbuf_out, ZBUF_SIZE, 0,
+                                            s, zlib_refill, NULL, NULL))) {
+            swf_read_close(s);
+            return AVERROR(ENOMEM);
+        }
+        swf->zpb->seekable = 0;
         pb = swf->zpb;
 #else
         av_log(s, AV_LOG_ERROR, "zlib support is required to read SWF compressed files\n");
@@ -291,7 +293,7 @@ static int swf_read_packet(AVFormatContext *s, AVPacket *pkt)
                 return AVERROR(ENOMEM);
             ast->duration = avio_rl32(pb); // number of samples
             if (((v>>4) & 15) == 2) { // MP3 sound data record
-                ast->skip_samples = avio_rl16(pb);
+                ast->internal->skip_samples = avio_rl16(pb);
                 len -= 2;
             }
             len -= 7;
@@ -306,15 +308,24 @@ static int swf_read_packet(AVFormatContext *s, AVPacket *pkt)
             for(i=0; i<s->nb_streams; i++) {
                 st = s->streams[i];
                 if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && st->id == ch_id) {
+                    int pkt_flags = 0;
                     frame = avio_rl16(pb);
                     len -= 2;
                     if (len <= 0)
                         goto skip;
+                    if (st->codecpar->codec_id == AV_CODEC_ID_FLASHSV) {
+                        unsigned flags = avio_r8(pb);
+                        len--;
+                        if (len <= 0)
+                            goto skip;
+                        pkt_flags |= (flags & FLV_VIDEO_FRAMETYPE_MASK) == FLV_FRAME_KEY ? AV_PKT_FLAG_KEY : 0;
+                    }
                     if ((res = av_get_packet(pb, pkt, len)) < 0)
                         return res;
                     pkt->pos = pos;
                     pkt->pts = frame;
                     pkt->stream_index = st->index;
+                    pkt->flags |= pkt_flags;
                     return pkt->size;
                 }
             }
@@ -367,14 +378,21 @@ static int swf_read_packet(AVFormatContext *s, AVPacket *pkt)
                     ch_id, bmp_fmt, width, height, linesize, len, out_len, colormapsize);
 
             zbuf = av_malloc(len);
-            buf  = av_malloc(out_len);
-            if (!zbuf || !buf) {
+            if (!zbuf) {
                 res = AVERROR(ENOMEM);
                 goto bitmap_end;
             }
 
             len = avio_read(pb, zbuf, len);
-            if (len < 0 || (res = uncompress(buf, &out_len, zbuf, len)) != Z_OK) {
+            if (len < 0)
+                goto bitmap_end_skip;
+
+            buf  = av_malloc(out_len);
+            if (!buf) {
+                res = AVERROR(ENOMEM);
+                goto bitmap_end;
+            }
+            if ((res = uncompress(buf, &out_len, zbuf, len)) != Z_OK) {
                 av_log(s, AV_LOG_WARNING, "Failed to uncompress one bitmap\n");
                 goto bitmap_end_skip;
             }

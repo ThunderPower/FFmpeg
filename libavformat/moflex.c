@@ -62,6 +62,8 @@ static int pop_int(BitReader *br, AVIOContext *pb, int n)
 
         if (ret < 0)
             return ret;
+        if (ret > INT_MAX - value - value)
+            return AVERROR_INVALIDDATA;
         value = 2 * value + ret;
     }
 
@@ -314,6 +316,8 @@ static int moflex_read_packet(AVFormatContext *s, AVPacket *pkt)
             }
 
             pkt_size = pop_int(br, pb, 13) + 1;
+            if (pkt_size > m->size)
+                return AVERROR_INVALIDDATA;
             packet   = s->streams[stream_index]->priv_data;
             if (!packet) {
                 avio_skip(pb, pkt_size);
@@ -340,8 +344,11 @@ static int moflex_read_packet(AVFormatContext *s, AVPacket *pkt)
 
         m->in_block = 0;
 
-        if (m->flags % 2 == 0)
+        if (m->flags % 2 == 0) {
+            if (m->size <= 0)
+                return AVERROR_INVALIDDATA;
             avio_seek(pb, m->pos + m->size, SEEK_SET);
+        }
     }
 
     return AVERROR_EOF;
